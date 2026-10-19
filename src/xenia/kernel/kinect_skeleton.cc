@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <atomic>
 #include <thread>
 
@@ -354,6 +355,54 @@ void GetFrameHeaderHook(cpu::ppc::PPCContext* ppc_context,
               memory->TranslateVirtual(kGlobalFrame), 0x30);
 }
 
+// 0x8251CD88: GetHandPosition(manager, out_xy, player, hand) -> bool. The title
+// asks the SDK's interaction library for a hand pointer; no SDK skeleton exists
+// here, so compute it from the injected player: the hand's offset from the
+// shoulder centre in metres, in the SDK's pointer space where +-0.75 spans the
+// screen (x right, y up). Only valid while the hand is raised above the spine.
+void GetHandPositionHook(cpu::ppc::PPCContext* ppc_context,
+                         KernelState* kernel_state) {
+  Memory* memory = kernel_state->memory();
+  const uint32_t out = uint32_t(ppc_context->r[4]);
+  const uint32_t player = uint32_t(ppc_context->r[5]);
+  const uint32_t hand = uint32_t(ppc_context->r[6]) & 0xFF;
+  ppc_context->r[3] = 0;
+  if (player != 0 || !out) return;
+
+  Skeleton skeleton;
+  if (cvars::kinect_live_skeleton) {
+    if (!GetLiveSkeleton(skeleton)) return;
+  } else {
+    MakeFakeStandingPlayer(skeleton, 0.0f);
+  }
+  // ponytail: hand index 1 = right hand, 0 = left; swap here if reversed.
+  const Vec4& h = skeleton.joints[hand ? 11 : 7];
+  const Vec4& shoulders = skeleton.joints[2];
+  const Vec4& spine = skeleton.joints[1];
+  if (h.y < spine.y) return;  // hand down: no cursor
+  constexpr float kGain = 1.5f;
+  float x = std::clamp((h.x - shoulders.x) * kGain, -0.75f, 0.75f);
+  float y = std::clamp((h.y - shoulders.y) * kGain, -0.75f, 0.75f);
+
+  // The title's own mapping from pointer space to screen pixels.
+  const float width = float(int32_t(
+      xe::load_and_swap<uint32_t>(memory->TranslateVirtual(0x832AA920))));
+  const float height = float(int32_t(
+      xe::load_and_swap<uint32_t>(memory->TranslateVirtual(0x832AA924))));
+  uint8_t* dest = memory->TranslateVirtual(out);
+  xe::store_and_swap<float>(dest, width * 0.5f * (x * (1.0f / 0.75f) + 1.0f));
+  xe::store_and_swap<float>(dest + 4,
+                            height * (1.0f - 0.5f * (y * (1.0f / 0.75f) + 1.0f)));
+  static uint32_t calls = 0;
+  if (++calls == 1 || calls % 600 == 0) {
+    XELOGI("Kinect hand cursor: hand {} pointer ({:.2f}, {:.2f}) -> screen "
+           "({:.0f}, {:.0f}) of {}x{}",
+           hand, x, y, width * 0.5f * (x / 0.75f + 1.0f),
+           height * (1.0f - 0.5f * (y / 0.75f + 1.0f)), width, height);
+  }
+  ppc_context->r[3] = 1;
+}
+
 // Call-site hook: runs the title's real NuiSkeletonGetNextFrame (so the SDK's
 // skeleton engine keeps draining and keeps estimating the floor), then writes
 // the fake player into skeleton slot 0 of whatever frame it returned.
@@ -568,6 +617,9 @@ void InstallKinectSkeletonHooks(KernelState* kernel_state,
   XELOGI("Kinect skeleton call-site hook installed at {:08X} -> stub {:08X}",
          kCallSite, kStubThunk);
 
+  // The title asks the (empty) SDK interaction library for the hand pointer.
+  InstallGuestHook(kernel_state, module, 0x8251CD88, "GetHandPosition",
+                   &GetHandPositionHook);
   // Debug accessors that also log their callers.
   InstallGuestHook(kernel_state, module, 0x82F8DBE0, "GetSkeletonData",
                    &GetSkeletonDataHook);
