@@ -88,3 +88,18 @@ Ruled out: my GPU changes (identical with the original `src/xenia/gpu`, A/B test
 Tried together (no fix, introduced a grass-patch glitch): `--metal_texture_cache_use_private=false --metal_texture_upload_via_blit=false --metal_allow_gamma_unorm16=true --metal_shared_memory_direct_write=false`.
 Ideas: capture a Metal frame and find the tile's texture/shader; check 1D/LUT ramp textures and exp-adjust/precision in the DXBC->Metal path (same family as the Kinect wide-1D precision bug).
 Note: "Press X to disable Controller mode" - the hand cursor only works once Controller mode is off.
+
+## Update (Oct 20, end of day): trackers + viewers; where we stopped
+- Python tracker (`harness/kinect_tracker.py`): world-pose body + torso depth, One-Euro filter, bone lock, grace period, background subtraction, matplotlib `--view`. Measured at rest: head z jitter 2.1 -> 0.8 cm.
+- **Native Swift tracker** (`harness/tracker-native/`): Apple Vision 3D pose on the Neural Engine, same placement/filters, own viewer: colour + depth with overlays, interactive SceneKit point cloud + skeleton, front/side views, head-depth plot, live tuning keys (`[ ] , . ; '`, `s` send, `r` reset). Viewer-only until `s` is pressed. Defaults 3 Hz / beta 12 (the first defaults were too smooth).
+- `harness/kinect_publish`: streams the sensor to the shared file without the game (build line in `KINECT.md`).
+- Hand cursor: Y gain 2.6, centre -0.10 m below shoulders, valid above the hips (`--kinect_cursor_*`).
+- Fork prepared: branch `kinect-support` with KINECT.md, tools/kinect, docs/kinect.
+
+### Next (tomorrow)
+1. Test the game with the native tracker (press `s`): latency/feel vs Python; tune filters live.
+2. Use depth more: show/verify alignment in the depth panel, then snap limb joints to the depth silhouette and a depth-based hand.
+3. Fine-tune cursor sensitivity; check reach to all corners.
+4. Metal UI tile garbling: use the draw tracer (`touch /tmp/xenia_trace_draws`) to find the shader/texture (signed/unsigned wrap suspected).
+5. Other Kinect titles (need dumps), avatars per profile, Windows? (not planned).
+6. Clean-ups: remove debug logging/accessor hooks, tidy the Swift palette code.
