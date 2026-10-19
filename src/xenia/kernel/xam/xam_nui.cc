@@ -7,17 +7,29 @@
  ******************************************************************************
  */
 
+#include <cstdlib>
+#include <cstring>
+
 #include "xenia/base/logging.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/kernel/xam/xam_private.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/xbox.h"
+
+DECLARE_bool(allow_kinect_camera);
+
+DEFINE_bool(nui_tilt_events, true,
+            "Send the initial tilt controller messages to the title's tilt callback.",
+            "Kernel");
 
 namespace xe {
 namespace kernel {
@@ -77,7 +89,11 @@ DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
 dword_result_t XamXStudioRequest_entry(dword_t request_type,
                                        lpdword_t result_ptr) {
   // Return failure to indicate XStudio/dev features not available.
-  XELOGW("XamXStudioRequest called, returning X_E_FAIL");
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    XELOGW("XamXStudioRequest called, returning X_E_FAIL (logged once)");
+  }
   return X_E_FAIL;
 }
 DECLARE_XAM_EXPORT1(XamXStudioRequest, kNone, kStub);
@@ -123,25 +139,79 @@ DECLARE_XAM_EXPORT1(XamNuiSkeletonGetBestSkeletonIndex, kNone, kStub);
    - most require message calls to xam in 0x0002Bxxx area
 */
 
-dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t unk) {
+struct X_NUI_TILT_STATUS {
+  xe::be<uint32_t> size;
+  xe::be<uint32_t> signature;  // 'XtSs'
+  xe::be<uint32_t> unknown_08[6];
+  // Gravity direction.
+  xe::be<int32_t> accelerometer[3];
+  // 0x1 and 0x2 moving, 0x4 stalled, 0x8 error.
+  xe::be<uint32_t> flags;
+  xe::be<uint32_t> unknown_30[8];
+};
+static_assert_size(X_NUI_TILT_STATUS, 0x50);
+
+dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t status_ptr) {
   /* Notes:
      - Used by XamNuiCameraElevationGetAngle, and XamNuiCameraSetFlags
-     - if it returns anything greater than -1 then both above functions continue
      - Both funcs send in a param of *unk = 0x50 bytes to copy
-     - unk2
-     - Ghidra decompile fails
+     - Titles use the gravity vector for floor detection
   */
-  return X_E_FAIL;
+  // ponytail: always a level, motionless camera. A real reading would come from
+  // the sensor's accelerometer (libfreenect freenect_get_mks_accel).
+  constexpr int32_t kAccelerometerOneG = 819;
+  auto status = status_ptr.as<X_NUI_TILT_STATUS*>();
+  if (!status || status->size < sizeof(X_NUI_TILT_STATUS) ||
+      status->signature != make_fourcc("XtSs")) {
+    static int rejected_log_count = 0;
+    if (status && rejected_log_count++ < 3) {
+      XELOGW("XamNuiCameraTiltGetStatus: rejected request size={:08X} sig={:08X}",
+             uint32_t(status->size), uint32_t(status->signature));
+    }
+    return X_E_FAIL;
+  }
+  std::memset(status->unknown_08, 0, sizeof(status->unknown_08));
+  int32_t accel[3] = {0, kAccelerometerOneG, 0};
+  xboxkrnl::GetKinectAccelerometer(accel);  // keeps the level default if absent
+  static int logged = 0;
+  static uint64_t tilt_status_calls = 0;
+  if (++tilt_status_calls % 100 == 0) {
+    XELOGI("XamNuiCameraTiltGetStatus call #{}", tilt_status_calls);
+  }
+  if (logged++ < 3) {
+    XELOGI("XamNuiCameraTiltGetStatus: accelerometer {} {} {}", accel[0],
+           accel[1], accel[2]);
+  }
+  status->accelerometer[0] = accel[0];
+  status->accelerometer[1] = accel[1];
+  status->accelerometer[2] = accel[2];
+  status->flags = 0;
+  std::memset(status->unknown_30, 0, sizeof(status->unknown_30));
+  return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraTiltGetStatus, kNone, kStub);
 
-dword_result_t XamNuiCameraElevationGetAngle_entry(lpqword_t unk1,
+dword_result_t XamNuiCameraElevationGetAngle_entry(lpdword_t angle_ptr,
                                                    lpdword_t unk2) {
   /* Notes:
      - Xam 12611 does not show what unk1 is used for (Ghidra)
+     - Titles poll this every frame as a "Kinect attached" probe: a failure
+       makes them open the NUI troubleshooter. They read *angle_ptr as a
+       signed 32-bit angle (Kinect Sports).
   */
-  uint32_t tilt_status[] = {0x58745373, 0x50};  // (XtSs)? & bytes to copy
-  X_STATUS result = XamNuiCameraTiltGetStatus_entry(tilt_status);
+  if (cvars::allow_kinect_camera) {
+    // ponytail: no tilt motor, report a level camera.
+    if (!angle_ptr || !unk2) {
+      return X_E_INVALIDARG;
+    }
+    *angle_ptr = 0;
+    *unk2 = 0;
+    return X_ERROR_SUCCESS;
+  }
+  X_NUI_TILT_STATUS tilt_status = {};
+  tilt_status.size = sizeof(tilt_status);
+  tilt_status.signature = make_fourcc("XtSs");
+  X_STATUS result = XamNuiCameraTiltGetStatus_entry(&tilt_status);
   if (XSUCCEEDED(result)) {
     // operation here
     // *unk1 = output1
@@ -150,6 +220,118 @@ dword_result_t XamNuiCameraElevationGetAngle_entry(lpqword_t unk1,
   return result;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraElevationGetAngle, kNone, kStub);
+
+// The sensor has no tilt motor here; titles only need these calls to succeed.
+dword_result_t XamNuiCameraTiltSetCallback_entry(lpvoid_t callback,
+                                                 lpvoid_t context) {
+  XELOGI("XamNuiCameraTiltSetCallback({:08X}, {:08X})",
+         callback.guest_address(), context.guest_address());
+  // The title's tilt controller is a state machine driven by XAM messages
+  // 0x2B005-0x2B00B sent to this callback as (message, buffer). Without them it
+  // never leaves its initial state. ponytail: only a fixed "ready, level" start
+  // sequence; no motor events since the camera has no motor here.
+  if (cvars::nui_tilt_events && callback) {
+    auto* thread = XThread::GetCurrentThread();
+    auto* buffer = kernel_state()->memory()->TranslateVirtual<uint32_t*>(
+        kernel_state()->memory()->SystemHeapAlloc(0x20));
+    std::memset(buffer, 0, 0x20);
+    const uint32_t buffer_address =
+        kernel_state()->memory()->HostToGuestVirtual(buffer);
+    for (uint32_t message : {0x2B009u, 0x2B005u}) {
+      uint64_t args[] = {message, buffer_address};
+      uint64_t result = kernel_state()->processor()->Execute(
+          thread->thread_state(), callback.guest_address(), args,
+          xe::countof(args));
+      XELOGI("Tilt callback message {:X} -> {:08X}", message,
+             uint32_t(result));
+    }
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraTiltSetCallback, kNone, kStub);
+
+dword_result_t XamNuiCameraRememberFloor_entry(lpvoid_t unk1, dword_t unk2) {
+  static int logged = 0;
+  // Debug aid (XENIA_FIND_FLOOR=1): find where the title keeps the floor plane
+  // it just reported, to locate its NUI_SKELETON_FRAME (vFloorClipPlane).
+  static const bool find_floor = std::getenv("XENIA_FIND_FLOOR") != nullptr;
+  if (find_floor && logged < 2) {
+    uint32_t value = unk1.guest_address();
+    Memory* memory = kernel_state()->memory();
+    int hits = 0;
+    for (uint64_t base = 0x40000000; base < 0xA0000000ull && hits < 12;
+         base += 0x1000) {
+      xe::BaseHeap* heap = memory->LookupHeap(uint32_t(base));
+      uint32_t protect = 0;
+      if (!heap || !heap->QueryProtect(uint32_t(base), &protect) || !protect) {
+        continue;
+      }
+      const uint32_t* page = memory->TranslateVirtual<const uint32_t*>(uint32_t(base));
+      for (uint32_t i = 0; i < 0x400 && hits < 12; ++i) {
+        if (xe::byte_swap(page[i]) == value) {
+          uint32_t address = uint32_t(base) + i * 4;
+          std::string context;
+          const uint32_t* around = page + i;
+          for (int k = -8; k < 24 && (int(i) + k) >= 0 && (i + k) < 0x400; ++k) {
+            context += fmt::format("{:08X} ", uint32_t(xe::byte_swap(around[k])));
+          }
+          XELOGI("Floor value found at {:08X}: {}", address, context);
+          ++hits;
+        }
+      }
+    }
+  }
+  if (find_floor && logged < 6) {
+    // The title's NuiSensor wrapper object is at *0x832A124C; its copy of the
+    // SDK skeleton frame (0xAB0 bytes) is at +0x2060.
+    Memory* memory = kernel_state()->memory();
+    uint32_t object = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(0x832A124C));
+    if (object) {
+      const uint8_t* frame = memory->TranslateVirtual(object + 0x2060);
+      std::string text;
+      for (uint32_t i = 0; i < 0x80; i += 4) {
+        text += fmt::format("{:08X} ", uint32_t(xe::load_and_swap<uint32_t>(frame + i)));
+        if (i % 16 == 12) text += "\n    ";
+      }
+      XELOGI("Skeleton frame copy at {:08X}:\n    {}", object + 0x2060, text);
+    }
+  }
+  if (logged++ < 20) {
+    const uint32_t* words = unk1.as<uint32_t*>();
+    XELOGI(
+        "XamNuiCameraRememberFloor({:08X}, {}): {:08X} {:08X} {:08X} {:08X} "
+        "{:08X} {:08X}",
+        unk1.guest_address(), uint32_t(unk2),
+        words ? uint32_t(xe::byte_swap(words[0])) : 0,
+        words ? uint32_t(xe::byte_swap(words[1])) : 0,
+        words ? uint32_t(xe::byte_swap(words[2])) : 0,
+        words ? uint32_t(xe::byte_swap(words[3])) : 0,
+        words ? uint32_t(xe::byte_swap(words[4])) : 0,
+        words ? uint32_t(xe::byte_swap(words[5])) : 0);
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraRememberFloor, kNone, kStub);
+
+dword_result_t XamNuiCameraElevationSetAngle_entry(dword_t angle,
+                                                   dword_t unk2) {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationSetAngle, kNone, kStub);
+
+dword_result_t XamNuiCameraElevationStopMovement_entry() {
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationStopMovement, kNone, kStub);
+
+dword_result_t XamNuiCameraTiltReportStatus_entry(lpvoid_t unk1) {
+  static int logged = 0;
+  if (logged++ < 5) {
+    XELOGI("XamNuiCameraTiltReportStatus({:08X})", unk1.guest_address());
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraTiltReportStatus, kNone, kStub);
 
 dword_result_t XamNuiCameraGetTiltControllerType_entry() {
   /* Notes:
@@ -178,8 +360,10 @@ dword_result_t XamNuiCameraSetFlags_entry(qword_t unk1, dword_t unk2) {
   int Controller_Type = XamNuiCameraGetTiltControllerType_entry();
 
   if (Controller_Type == 1) {
-    uint32_t tilt_status[] = {0x58745373, 0x50};  // (XtSs)? & bytes to copy
-    result = XamNuiCameraTiltGetStatus_entry(tilt_status);
+    X_NUI_TILT_STATUS tilt_status = {};
+    tilt_status.size = sizeof(tilt_status);
+    tilt_status.signature = make_fourcc("XtSs");
+    result = XamNuiCameraTiltGetStatus_entry(&tilt_status);
     if (XSUCCEEDED(result)) {
       // op here
       // result =

@@ -7,10 +7,18 @@
  ******************************************************************************
  */
 
+#include <cstring>
+
 #include "xenia/kernel/xam/xam_avatar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
+
+DEFINE_bool(synthetic_avatar, false,
+            "Give titles a built-in placeholder avatar: a default manifest and "
+            "asset buffers that parse as an avatar with no meshes. Needs "
+            "allow_avatar_initialization. Experimental.",
+            "Kernel");
 
 DEFINE_bool(allow_avatar_initialization, false,
             "Enable Avatar Initialization\n"
@@ -90,6 +98,14 @@ dword_result_t XamAvatarGetManifestLocalUser_entry(
             &avatar_info_setting_data, avatar_metadata_address);
 
     // Profile doesn't have avatar info setting
+    if (!avatar_info_setting_data.data.data.binary.ptr &&
+        cvars::synthetic_avatar) {
+      // ponytail: all-zero manifest, enough for titles to treat it as an avatar.
+      std::memset(
+          kernel_state()->memory()->TranslateVirtual(avatar_metadata_ptr.guest_address()),
+          0, sizeof(X_AVATAR_METADATA));
+      return X_ERROR_SUCCESS;
+    }
     if (!avatar_info_setting_data.data.data.binary.ptr) {
       extended_error = X_E_FAIL;
       return X_ERROR_FUNCTION_FAILED;
@@ -128,8 +144,11 @@ DECLARE_XAM_EXPORT1(XamAvatarGetManifestsByXuid, kAvatars, kStub)
 dword_result_t XamAvatarGetAssetsResultSize_entry(
     dword_t avatar_component_mask, lpdword_t result_buffer_size_ptr,
     lpdword_t gpu_resource_buffer_size_ptr) {
-  *result_buffer_size_ptr = 0;
-  *gpu_resource_buffer_size_ptr = 0;
+  // Titles allocate these and treat a NULL allocation as failure, so report
+  // a small non-zero size for the synthetic avatar.
+  const uint32_t size = cvars::synthetic_avatar ? 0x1000 : 0;
+  *result_buffer_size_ptr = size;
+  *gpu_resource_buffer_size_ptr = size;
 
   return X_STATUS_SUCCESS;
 }
@@ -140,6 +159,15 @@ dword_result_t XamAvatarGetAssets_entry(
     dword_t avatar_component_mask, dword_t flags, lpdword_t result_buffer_ptr,
     lpdword_t gpu_resource_buffer_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (cvars::synthetic_avatar) {
+    // The title zeroed both buffers: a result header with 0 models.
+    if (overlapped_ptr) {
+      kernel_state()->CompleteOverlappedImmediateEx(
+          overlapped_ptr, X_ERROR_SUCCESS, X_ERROR_SUCCESS, 0);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_STATUS_SUCCESS;
+  }
   // 58410907 doesn't crash if we return failure.
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediateEx(

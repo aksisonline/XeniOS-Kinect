@@ -175,6 +175,28 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       XELOGD("XamUnk2B004, unimplemented");
       return X_E_SUCCESS;
     }
+    // NUI trace/report messages (0x2A005-0x2A008), camera state messages
+    // (0x2B001/0x2B002) and identity query (0x2C00C): titles poll these every
+    // frame and only check that they succeed.
+    case 0x0002A005:
+    case 0x0002A006:
+    case 0x0002A007:
+    case 0x0002A008:
+    case 0x0002B001:
+    case 0x0002B002:
+    case 0x0002C00C: {
+      return X_E_SUCCESS;
+    }
+    case 0x0002C009: {
+      // Registers (non-zero) or removes (zero) a Kinect identity callback.
+      // TODO: invoke the callback for identity notifications.
+      if (!buffer_ptr) {
+        return X_E_INVALIDARG;
+      }
+      XELOGD("XamApp: Kinect identity callback {:08X}",
+             xe::load_and_swap<uint32_t>(buffer));
+      return X_E_SUCCESS;
+    }
     // Causes dashboard to correctly process language/region change. It does not
     // contain any buffer.
     case 0x8000000D: {

@@ -27,6 +27,13 @@ xe::cpu::Export* RegisterExport_xboxkrnl(xe::cpu::Export* export_entry);
 #include "xboxkrnl_module_export_groups.inc"
 #undef XE_MODULE_EXPORT_GROUP
 
+// Stops the camera worker and releases a host camera opened for
+// PsCamDeviceRequest.
+void ShutdownCameraDevice();
+
+// Latest accelerometer reading of the host Kinect (1 g = 819); false if none.
+bool GetKinectAccelerometer(int32_t out[3]);
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

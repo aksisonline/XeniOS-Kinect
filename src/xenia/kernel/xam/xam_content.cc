@@ -7,7 +7,10 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <atomic>
+#include <map>
+#include <mutex>
 
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -462,14 +465,115 @@ dword_result_t XamContentCreateInternal_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentCreateInternal, kContent, kImplemented);
 
+static std::string ContentFileKey(std::string name) {
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return name;
+}
+
+// Packages mounted by XamContentOpenFile: root name (lowercase) -> device path.
+static std::mutex g_content_file_mutex;
+static std::map<std::string, std::string> g_content_file_devices;
+static int g_content_file_counter = 0;
+
+// Mounts a package file that lives in the guest filesystem (for example an STFS
+// package on the game disc) under the given root name. The package is copied
+// out of the guest filesystem to a host temp file once, then mounted as a
+// container device. Titles use it for their Kinect identity data.
 dword_result_t XamContentOpenFile_entry(
     dword_t user_index, lpstring_t root_name, lpstring_t path, dword_t flags,
     lpdword_t disposition_ptr, lpdword_t license_mask_ptr,
     pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
-  // TODO(gibbed): arguments assumed based on XamContentCreate.
-  return X_ERROR_FILE_NOT_FOUND;
+  // ponytail: flags are ignored and the package is read-only.
+  if (!root_name || *root_name == '\0') {
+    return X_ERROR_INVALID_NAME;
+  }
+  if (!path || *path == '\0') {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  std::string root = root_name.value();
+  std::string symlink = root.ends_with(':') ? root : root + ':';
+  auto fs = kernel_state()->file_system();
+  if (fs->IsSymbolicLinkRegistered(symlink)) {
+    return X_ERROR_ALREADY_EXISTS;
+  }
+
+  vfs::Entry* entry = fs->ResolvePath(path.value());
+  if (!entry) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+
+  const std::filesystem::path cache_dir =
+      std::filesystem::temp_directory_path() / "xenia-content-files";
+  std::error_code ec;
+  std::filesystem::create_directories(cache_dir, ec);
+  const std::filesystem::path host_path =
+      cache_dir / fmt::format("{:08X}_{}_{}.pkg", kernel_state()->title_id(),
+                              root, entry->size());
+
+  if (!std::filesystem::exists(host_path, ec) ||
+      std::filesystem::file_size(host_path, ec) != entry->size()) {
+    vfs::File* file = nullptr;
+    if (entry->Open(vfs::FileAccess::kFileReadData, &file) !=
+        X_STATUS_SUCCESS) {
+      return X_ERROR_FILE_NOT_FOUND;
+    }
+    FILE* out = xe::filesystem::OpenFile(host_path, "wb");
+    if (!out) {
+      file->Destroy();
+      return X_ERROR_ACCESS_DENIED;
+    }
+    std::vector<uint8_t> chunk(1 << 20);
+    for (size_t offset = 0; offset < entry->size(); offset += chunk.size()) {
+      size_t want = std::min(chunk.size(), entry->size() - offset);
+      size_t read = 0;
+      if (file->ReadSync(std::span<uint8_t>(chunk.data(), want), offset,
+                         &read) != X_STATUS_SUCCESS ||
+          read != want) {
+        break;
+      }
+      fwrite(chunk.data(), 1, read, out);
+    }
+    fclose(out);
+    file->Destroy();
+    if (std::filesystem::file_size(host_path, ec) != entry->size()) {
+      std::filesystem::remove(host_path, ec);
+      return X_ERROR_FILE_NOT_FOUND;
+    }
+  }
+
+  std::string device_path;
+  {
+    std::lock_guard<std::mutex> lock(g_content_file_mutex);
+    device_path =
+        fmt::format("\\Device\\ContentFile\\{}\\", ++g_content_file_counter);
+  }
+  auto device =
+      vfs::XContentContainerDevice::CreateContentDevice(device_path, host_path);
+  if (!device || !device->Initialize()) {
+    XELOGW("XamContentOpenFile: {} is not a valid package", path.value());
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  fs->RegisterDevice(std::move(device));
+  fs->RegisterSymbolicLink(symlink, device_path);
+  {
+    std::lock_guard<std::mutex> lock(g_content_file_mutex);
+    g_content_file_devices[ContentFileKey(root)] = device_path;
+  }
+  XELOGI("XamContentOpenFile: mounted {} as {}", path.value(), symlink);
+
+  if (license_mask_ptr) {
+    *license_mask_ptr = 0;
+  }
+  if (overlapped_ptr) {
+    kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
+                                                X_ERROR_SUCCESS);
+    return X_ERROR_IO_PENDING;
+  }
+  return X_ERROR_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kStub);
+DECLARE_XAM_EXPORT1(XamContentOpenFile, kContent, kSketchy);
 
 dword_result_t XamContentFlush_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
@@ -486,8 +590,29 @@ DECLARE_XAM_EXPORT1(XamContentFlush, kContent, kStub);
 dword_result_t XamContentClose_entry(lpstring_t root_name,
                                      pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result =
-      kernel_state()->content_manager()->CloseContent(root_name.value());
+  X_RESULT result;
+  std::string file_device;
+  {
+    std::lock_guard<std::mutex> lock(g_content_file_mutex);
+    auto it = g_content_file_devices.find(
+        ContentFileKey(root_name.value()));
+    if (it != g_content_file_devices.end()) {
+      file_device = it->second;
+      g_content_file_devices.erase(it);
+    }
+  }
+  if (!file_device.empty()) {
+    // Mounted by XamContentOpenFile.
+    auto fs = kernel_state()->file_system();
+    std::string symlink = root_name.value();
+    fs->UnregisterSymbolicLink(symlink.ends_with(':') ? symlink
+                                                      : symlink + ':');
+    fs->UnregisterDevice(file_device);
+    result = X_ERROR_SUCCESS;
+  } else {
+    result =
+        kernel_state()->content_manager()->CloseContent(root_name.value());
+  }
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr, result);

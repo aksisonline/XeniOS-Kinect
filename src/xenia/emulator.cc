@@ -9,6 +9,9 @@
 
 #include <ranges>
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "xenia/emulator.h"
 
 #include <algorithm>
@@ -40,6 +43,7 @@
 #include "xenia/hid/input_system.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/kinect_skeleton.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xam/achievement_manager.h"
@@ -50,6 +54,8 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
+#include "xenia/base/string_buffer.h"
+#include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
@@ -1739,6 +1745,57 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   } else if (ex->code() == Exception::Code::kIllegalInstruction) {
     crash_msg.append("Illegal Instruction\n");
   }
+  {
+    // Disassembly around the faulting guest instruction.
+    const uint32_t crash_pc =
+        guest_function->MapMachineCodeToGuestAddress(ex->pc());
+    crash_msg.append(fmt::format("LR: 0x{:08X} CTR: 0x{:08X}\n",
+                                 static_cast<uint32_t>(context->lr),
+                                 static_cast<uint32_t>(context->ctr)));
+    crash_msg.append("Disassembly:\n");
+    for (uint32_t addr = crash_pc - 0x80; addr <= crash_pc + 0x10; addr += 4) {
+      uint32_t code = xe::load_and_swap<uint32_t>(
+          memory_->TranslateVirtual(addr));
+      StringBuffer sb;
+      xe::cpu::ppc::DisasmPPC(addr, code, &sb);
+      crash_msg.append(fmt::format("{} {:08X}  {:08X}  {}\n",
+                                   addr == crash_pc ? ">>" : "  ", addr, code,
+                                   sb.to_string()));
+    }
+  }
+  if (const char* range = std::getenv("XENIA_CRASH_DISASM")) {
+    // Debug aid: "START:END" (hex guest addresses) to disassemble on a crash.
+    uint32_t start = 0, end = 0;
+    if (std::sscanf(range, "%x:%x", &start, &end) == 2) {
+      crash_msg.append("Requested disassembly:\n");
+      for (uint32_t addr = start; addr < end; addr += 4) {
+        uint32_t code =
+            xe::load_and_swap<uint32_t>(memory_->TranslateVirtual(addr));
+        StringBuffer sb;
+        xe::cpu::ppc::DisasmPPC(addr, code, &sb);
+        crash_msg.append(
+            fmt::format("   {:08X}  {:08X}  {}\n", addr, code, sb.to_string()));
+      }
+    }
+  }
+  if (const char* image_path = std::getenv("XENIA_CRASH_DUMP_IMAGE")) {
+    // Debug aid: write the loaded guest image (0x82000000..0x83300000) to a
+    // file for offline disassembly. Unmapped 64 KiB pages are written as zero.
+    if (FILE* image = std::fopen(image_path, "wb")) {
+      std::vector<uint8_t> zeros(0x10000, 0);
+      for (uint32_t addr = 0x82000000; addr < 0x83300000; addr += 0x10000) {
+        uint32_t protect = 0;
+        auto* heap = memory_->LookupHeap(addr);
+        if (heap && heap->QueryProtect(addr, &protect) && protect) {
+          std::fwrite(memory_->TranslateVirtual(addr), 1, 0x10000, image);
+        } else {
+          std::fwrite(zeros.data(), 1, zeros.size(), image);
+        }
+      }
+      std::fclose(image);
+      crash_msg.append(fmt::format("Image dumped to {}\n", image_path));
+    }
+  }
   crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
     crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
@@ -1997,6 +2054,11 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
     }
+  }
+
+  if (module->xex_module()) {
+    kernel::InstallKinectSkeletonHooks(kernel_state_.get(),
+                                       module->xex_module(), title_id_.value_or(0));
   }
 
   // Try and load the resource database (xex only).

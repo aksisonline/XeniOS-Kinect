@@ -871,6 +871,37 @@ dword_result_t NtReleaseMutant_entry(dword_t mutant_handle,
 }
 DECLARE_XBOXKRNL_EXPORT1(NtReleaseMutant, kThreading, kImplemented);
 
+void KeInitializeMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                              dword_t initial_owner) {
+  mutant_ptr.Zero();
+  mutant_ptr->header.type = X_DISPATCHER_FLAGS::DISPATCHER_MUTANT;
+  // signal_state: 1 free, 0 held once.
+  mutant_ptr->header.signal_state = initial_owner ? 0 : 1;
+  if (initial_owner) {
+    mutant_ptr->owner = XThread::GetCurrentThread()->guest_object();
+  }
+  auto mutant = XObject::GetNativeObject<XMutant>(
+      kernel_state(), mutant_ptr, X_DISPATCHER_FLAGS::DISPATCHER_MUTANT);
+  if (!mutant) {
+    assert_always();
+  }
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeMutant, kThreading, kImplemented);
+
+dword_result_t KeReleaseMutant_entry(pointer_t<X_KMUTANT> mutant_ptr,
+                                     dword_t increment, dword_t abandoned,
+                                     dword_t wait) {
+  auto mutant = XObject::GetNativeObject<XMutant>(kernel_state(), mutant_ptr);
+  if (!mutant) {
+    return 0;
+  }
+  // Returns the previous signal state; titles only check it for errors.
+  const int32_t previous = mutant_ptr->header.signal_state;
+  mutant->ReleaseMutant(increment, !!abandoned, !!wait);
+  return static_cast<uint32_t>(previous);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseMutant, kThreading, kImplemented);
+
 dword_result_t NtCreateTimer_entry(lpdword_t handle_ptr,
                                    lpvoid_t obj_attributes_ptr,
                                    dword_t timer_type) {
