@@ -117,3 +117,10 @@ CMakeUserPresets.json
 /cache0
 /devkit
 recent.toml
+
+# Kinect tooling build outputs
+tools/kinect/kinect_publish
+tools/kinect/kinect_dump
+tools/kinect/tracker-native/kinect_tracker_native
+tools/kinect/.venv*/
+tools/kinect/preview/kstream

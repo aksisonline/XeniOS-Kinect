@@ -1,0 +1,36 @@
+<!doctype html><meta charset=utf-8><title>Kinect live</title>
+<style>body{margin:0;background:#111;color:#ccc;font:12px monospace;display:flex;height:100vh}
+#l{width:330px;padding:8px}canvas.v{width:320px;display:block;margin-bottom:8px}#c{flex:1}</style>
+<div id=l><div id=fps>connecting…</div><canvas class=v id=dc width=640 height=480></canvas><canvas class=v id=rc width=640 height=480></canvas>drag=rotate, wheel=zoom</div><div id=c></div>
+<script type=importmap>{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","oc":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"}}</script>
+<script type=module>
+import * as T from "three"; import {OrbitControls} from "oc";
+const N=640*480, W=640, H=480, f=585.6; // ponytail: nominal Kinect v1 focal length, no per-device calibration
+const el=document.getElementById("c"), r=new T.WebGLRenderer({antialias:true}); el.append(r.domElement);
+const sc=new T.Scene(), cam=new T.PerspectiveCamera(60,1,.1,20); cam.position.set(0,0,-.5); 
+const ctl=new OrbitControls(cam,r.domElement); ctl.target.set(0,0,2);
+const pos=new Float32Array(N*3), col=new Float32Array(N*3), g=new T.BufferGeometry();
+g.setAttribute("position",new T.BufferAttribute(pos,3)); g.setAttribute("color",new T.BufferAttribute(col,3));
+const pts=new T.Points(g,new T.PointsMaterial({size:.012,vertexColors:true})); pts.frustumCulled=false; sc.add(pts);
+const rs=()=>{r.setSize(el.clientWidth,innerHeight);cam.aspect=el.clientWidth/innerHeight;cam.updateProjectionMatrix()};addEventListener("resize",rs);rs();
+const dctx=dc.getContext("2d"),rctx=rc.getContext("2d"),di=dctx.createImageData(W,H),ri=rctx.createImageData(W,H);
+let n=0,t0=performance.now();
+const ws=new WebSocket(`ws://${location.host}`);ws.binaryType="arraybuffer";
+ws.onmessage=e=>{
+  const dep=new Uint16Array(e.data,0,N), rgb=new Uint8Array(e.data,N*2);
+  for(let i=0;i<N;i++){
+    const z=dep[i]/1000, x=i%W, y=(i/W)|0, o=i*3;
+    const ok=z>0; // z=0 → no reading; park point at origin
+    pos[o]=ok?(x-W/2)*z/f:0; pos[o+1]=ok?-(y-H/2)*z/f:0; pos[o+2]=z;
+    col[o]=rgb[o]/255; col[o+1]=rgb[o+1]/255; col[o+2]=rgb[o+2]/255;
+    const v=ok?255-Math.min(255,dep[i]/16):0, p=i*4; // near=bright, 4m+ = dark
+    di.data[p]=di.data[p+1]=di.data[p+2]=v; di.data[p+3]=255;
+    ri.data[p]=rgb[o]; ri.data[p+1]=rgb[o+1]; ri.data[p+2]=rgb[o+2]; ri.data[p+3]=255;
+  }
+  g.attributes.position.needsUpdate=g.attributes.color.needsUpdate=true;
+  dctx.putImageData(di,0,0); rctx.putImageData(ri,0,0);
+  if(++n%15==0){fps.textContent=(15000/(performance.now()-t0)).toFixed(1)+" fps";t0=performance.now()}
+};
+ws.onclose=()=>fps.textContent="disconnected";
+(function a(){requestAnimationFrame(a);ctl.update();r.render(sc,cam)})();
+</script>
