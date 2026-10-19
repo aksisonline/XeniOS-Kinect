@@ -36,6 +36,7 @@
 #include "xenia/gpu/shaders/bytecode/metal/resolve_fast_64bpp_1x2xmsaa_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/metal/resolve_fast_64bpp_4xmsaa_cs.h"
 #include "xenia/gpu/shaders/bytecode/metal/resolve_fast_64bpp_4xmsaa_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/metal/resolve_dxt3aas1111_cs.h"
 #include "xenia/gpu/shaders/bytecode/metal/resolve_full_128bpp_cs.h"
 #include "xenia/gpu/shaders/bytecode/metal/resolve_full_128bpp_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/metal/resolve_full_16bpp_cs.h"
@@ -951,6 +952,7 @@ bool MetalRenderTargetCache::InitializeEdramComputeShaders() {
       }
     }
   }
+  resolve_dxt3aas1111_pipeline_ = nullptr;
   ResetDirectHostResolvePipelines(false);
   for (size_t i = 0; i < xe::countof(host_depth_store_pipelines_); ++i) {
     host_depth_store_pipelines_[i] = nullptr;
@@ -1042,6 +1044,14 @@ bool MetalRenderTargetCache::InitializeEdramComputeShaders() {
       XELOGE("Metal: failed to initialize resolve compute pipelines");
       return false;
     }
+  }
+
+  resolve_dxt3aas1111_pipeline_ = CreateComputePipelineFromEmbeddedLibrary(
+      device_, resolve_dxt3aas1111_cs_metallib,
+      sizeof(resolve_dxt3aas1111_cs_metallib), "resolve_dxt3aas1111_cs");
+  if (!resolve_dxt3aas1111_pipeline_) {
+    XELOGE("Metal: failed to initialize the DXT3A as 1_1_1_1 resolve pipeline");
+    return false;
   }
 
   InitializeDirectHostResolvePipelines(draw_resolution_scaled);
@@ -1656,6 +1666,10 @@ void MetalRenderTargetCache::ShutdownEdramComputeShaders() {
       }
     }
   }
+  if (resolve_dxt3aas1111_pipeline_) {
+    resolve_dxt3aas1111_pipeline_->release();
+    resolve_dxt3aas1111_pipeline_ = nullptr;
+  }
   ResetDirectHostResolvePipelines(true);
   for (size_t i = 0; i < xe::countof(host_depth_store_pipelines_); ++i) {
     if (host_depth_store_pipelines_[i]) {
@@ -1697,6 +1711,9 @@ void MetalRenderTargetCache::BeginFrame() {
 
 MTL::ComputePipelineState* MetalRenderTargetCache::GetResolvePipeline(
     draw_util::ResolveCopyShaderIndex copy_shader, bool scaled) const {
+  if (copy_shader == draw_util::ResolveCopyShaderIndex::kDXT3AAs1111) {
+    return scaled ? nullptr : resolve_dxt3aas1111_pipeline_;
+  }
   size_t scaled_index = scaled ? 1u : 0u;
   if (IsResolveDirectHostRTFastCandidate(copy_shader)) {
     return resolve_fast_pipelines_[scaled_index][ResolveFastBppIndex(
@@ -3901,8 +3918,9 @@ MTL::RenderPipelineState* MetalRenderTargetCache::GetOrCreateEdramLoadPipeline(
   return pipeline;
 }
 
-bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
-                                                ResolvePlan& plan_out) {
+bool MetalRenderTargetCache::PrepareResolvePlan(
+    Memory& memory, ResolvePlan& plan_out,
+    const draw_util::ResolveRectangle* rectangle) {
   plan_out = ResolvePlan();
   const RegisterFile& regs = register_file();
 
@@ -3918,7 +3936,8 @@ bool MetalRenderTargetCache::PrepareResolvePlan(Memory& memory,
   if (!draw_util::GetResolveInfo(regs, memory, *trace_writer_,
                                  draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_rg16_trunc,
-                                 fixed_rgba16_trunc, plan_out.resolve_info)) {
+                                 fixed_rgba16_trunc, plan_out.resolve_info,
+                                 rectangle)) {
     XELOGE("MetalRenderTargetCache::Resolve: GetResolveInfo failed");
     return false;
   }

@@ -237,7 +237,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   };
 
   // Resolve (copy) render targets to shared memory
-  bool PrepareResolvePlan(Memory& memory, ResolvePlan& plan_out);
+  bool PrepareResolvePlan(Memory& memory, ResolvePlan& plan_out,
+                          const draw_util::ResolveRectangle* rectangle =
+                              nullptr);
   bool Resolve(Memory& memory, uint32_t& written_address,
                uint32_t& written_length,
                MTL::CommandBuffer* command_buffer = nullptr,
@@ -304,6 +306,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   MTL::ComputePipelineState*
       resolve_fast_pipelines_[kResolveScaledCount][kResolveFastBppCount]
                              [kResolveFastMsaaCount] = {};
+  // xenos::CopyCommand::kConvertTo1111 (compare to 1-bit masks, unscaled only).
+  MTL::ComputePipelineState* resolve_dxt3aas1111_pipeline_ = nullptr;
 
   // Direct host resolve compute shaders (host RT -> shared/scaled resolve
   // memory) for fast and full color copies plus depth copies.

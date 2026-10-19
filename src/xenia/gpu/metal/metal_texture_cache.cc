@@ -12,6 +12,7 @@
 #include "xenia/gpu/metal/metal_heap_pool.h"
 
 #include <algorithm>
+#include <set>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -759,6 +760,26 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     }
     TextureKey texture_key = texture->key();
     if (base_outdated_mask & (UINT64_C(1) << i)) {
+      if (texture_key.base_page == (0x1E430000u >> 12)) {
+        static uint32_t depth_view_loads = 0;
+        if (++depth_view_loads % 200 == 1) {
+          XELOGI("Depth-ring texture view load #{} (base outdated, mips {})",
+                 depth_view_loads, (mips_outdated_mask & (UINT64_C(1) << i)) != 0);
+        }
+      }
+      static std::set<uint64_t> seen_textures;
+      uint64_t seen_key = (uint64_t(texture_key.base_page) << 40) ^
+                          (uint64_t(texture_key.width_minus_1) << 24) ^
+                          (uint64_t(texture_key.height_minus_1) << 8) ^
+                          uint64_t(texture_key.format);
+      if (seen_textures.size() < 400 && seen_textures.insert(seen_key).second) {
+        XELOGI("Texture load: base {:08X} {}x{} dim {} fmt {} pitch {} tiled {} size {}",
+               uint32_t(texture_key.base_page << 12),
+               texture_key.width_minus_1 + 1, texture_key.height_minus_1 + 1,
+               uint32_t(texture_key.dimension), uint32_t(texture_key.format),
+               uint32_t(texture_key.pitch), uint32_t(texture_key.tiled),
+               texture->GetGuestBaseSize());
+      }
       add_range_if_needed(static_cast<uint32_t>(texture_key.base_page << 12),
                           xe::align(texture->GetGuestBaseSize(), UINT32_C(16)));
     }
@@ -796,8 +817,20 @@ bool MetalTextureCache::PrepareTextureDataLoadRanges(
     XELOGE("Metal texture data residency requires a command processor");
     return false;
   }
-  return command_processor_->RequestSharedMemoryRanges(
+  bool request_ok = command_processor_->RequestSharedMemoryRanges(
       reason, ranges.data(), static_cast<uint32_t>(ranges.size()));
+  static int request_logs = 0;
+  for (const SharedMemory::Range& range : ranges) {
+    if (range.start >= 0x1E400000 && range.start < 0x1E600000 &&
+        request_logs++ < 12) {
+      XELOGI(
+          "Camera range request {:08X}+{}: ok={} valid_after={} ranges={}",
+          range.start, range.length, request_ok,
+          shared_memory().IsRangeValid(range.start, range.length),
+          ranges.size());
+    }
+  }
+  return request_ok;
 }
 
 bool MetalTextureCache::RequestTextureDataRange(Texture&,

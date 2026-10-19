@@ -326,6 +326,16 @@ class MetalCommandProcessor final : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // Resolves one rectangle (null = taken from vf0), or the rectangles produced
+  // by running the draw's vertex shader on the CPU.
+  bool IssueCopyRectangle(const draw_util::ResolveRectangle* rectangle);
+  bool IssueCopyVertexShaderPath();
+  // readback_resolve=full: waits for the GPU and copies the resolved range from
+  // the Metal shared memory buffer into guest memory, so the guest CPU (and the
+  // resolve vertex shader interpreter) can see it. Kinect NUI needs this.
+  void ReadbackResolvedRange();
+  uint32_t resolve_readback_begin_ = UINT32_MAX;
+  uint32_t resolve_readback_end_ = 0;
 
   // ZPD occlusion query backend overrides.
   void PollCompletedSubmission() override;

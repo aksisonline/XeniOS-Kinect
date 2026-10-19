@@ -506,6 +506,16 @@ struct MemExportRange {
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
 
+// Returns whether the vertex shader should get the resolve rectangles.
+// D3D normal resolve gives three float2 vertices in vf0, which are directly
+// read without running the shader.
+inline bool IsResolveUsingVertexShader(const RegisterFile& regs) {
+  xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+  return fetch.type != xenos::FetchConstantType::kVertex ||
+         fetch.size != 3 * 2 ||
+         regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices > 3;
+}
+
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).
 XE_NOINLINE
@@ -602,6 +612,9 @@ enum class ResolveCopyShaderIndex {
   kFull64bpp,
   kFull128bpp,
 
+  // xenos::CopyCommand::kConvertTo1111 to k_DXT3A_AS_1_1_1_1.
+  kDXT3AAs1111,
+
   kCount,
   kUnknown = kCount,
 };
@@ -629,6 +642,13 @@ struct ResolveCopyShaderConstants {
   };
   DestRelative dest_relative;
   uint32_t dest_base;
+  // kConvertTo1111 constants follow dest_base in the unscaled shader.
+  // RB_COPY_FUNC, a 3 bit CompareFunction per component in bits 0, 4, 8, 12.
+  uint32_t copy_func;
+  // RB_COPY_REF.
+  uint32_t copy_ref;
+  // RB_COPY_MASK.
+  uint32_t copy_mask;
 };
 
 struct ResolveClearShaderConstants {
@@ -683,6 +703,11 @@ struct ResolveInfo {
   uint32_t rb_depth_clear;
   uint32_t rb_color_clear;
   uint32_t rb_color_clear_lo;
+
+  // For xenos::CopyCommand::kConvertTo1111.
+  uint32_t rb_copy_func;
+  uint32_t rb_copy_ref;
+  uint32_t rb_copy_mask;
 
   bool IsCopyingDepth() const {
     return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
@@ -755,6 +780,14 @@ struct ResolveInfo {
   }
 };
 
+// GetResolveInfo adds the half pixel and window offsets.
+struct ResolveRectangle {
+  float left;
+  float top;
+  float right;
+  float bottom;
+};
+
 // Returns false if there was an error obtaining the info making it totally
 // invalid. fixed_rg[ba]16_truncated_to_minus_1_to_1 is false if 16_16[_16_16]
 // color render target formats are properly emulated as -32...32, true if
@@ -765,7 +798,8 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1,
-                    ResolveInfo& info_out);
+                    ResolveInfo& info_out,
+                    const ResolveRectangle* rectangle = nullptr);
 
 // Maximum length for debug marker labels.
 static constexpr size_t kDebugMarkerLabelMaxLength = 256;

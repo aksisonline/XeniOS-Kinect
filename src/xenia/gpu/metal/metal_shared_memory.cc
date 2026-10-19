@@ -382,8 +382,22 @@ bool MetalSharedMemory::UploadRanges(
     }
   };
 
+  auto debug_camera_upload = [&](const char* route, uint32_t start,
+                                 uint32_t end) {
+    static int logs = 0;
+    if (end > 0x1E430000 && start < 0x1E600000 && logs++ < 20) {
+      uint32_t nonzero = 0;
+      for (uint32_t i = start; i < end; ++i) {
+        nonzero += xbox_data[i] != 0;
+      }
+      XELOGI("Shared memory camera upload ({}): {:08X}-{:08X}, guest nonzero {}",
+             route, start, end, nonzero);
+    }
+  };
+
   auto direct_write_run = [&](uint32_t start, uint32_t end) {
     uint32_t size = end - start;
+    debug_camera_upload("direct", start, end);
     copy_guest_bytes(shared_buffer_contents + start, start, size);
     swcache::WriteFence();
     MakeRangeValid(start, size, false);
@@ -397,6 +411,7 @@ bool MetalSharedMemory::UploadRanges(
     }
     uint32_t offset = start;
     uint32_t remaining = end - start;
+    debug_camera_upload("staged", start, end);
     while (remaining) {
       MTL::BlitCommandEncoder* encoder = get_blit_encoder();
       if (!encoder) {

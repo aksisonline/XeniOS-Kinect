@@ -11,6 +11,9 @@
 
 #include <dispatch/dispatch.h>
 #include <algorithm>
+#include <set>
+#include <map>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -44,6 +47,7 @@
 #include "xenia/gpu/metal/metal_graphics_system.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/registers.h"
+#include "xenia/gpu/resolve_vertex_processor.h"
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
@@ -2627,6 +2631,8 @@ Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+static std::vector<std::string> g_recent_draws;
+
 bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                       uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
@@ -2678,6 +2684,24 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   } else {
     if (!memexport_used_vertex) {
       return true;
+    }
+  }
+  {
+    // Debug aid: remember the draws since the last resolve (see Stage stats).
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>();
+    g_recent_draws.push_back(fmt::format(
+        "prim {} idx {} vs {:016X} ps {} rt0 fmt {} base {} pitch {} mask {:X} "
+        "rast {} mode {}",
+        uint32_t(primitive_type), index_count,
+        vertex_shader->ucode_data_hash(),
+        pixel_shader ? fmt::format("{:016X}", pixel_shader->ucode_data_hash())
+                     : std::string("none"),
+        uint32_t(color_info.color_format), uint32_t(color_info.color_base),
+        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
+        regs.Get<uint32_t>(XE_GPU_REG_RB_COLOR_MASK), is_rasterization_done,
+        uint32_t(edram_mode)));
+    if (g_recent_draws.size() > 64) {
+      g_recent_draws.erase(g_recent_draws.begin());
     }
   }
   bool memexport_used_pixel =
@@ -5590,6 +5614,13 @@ bool MetalCommandProcessor::DispatchDraw(
   }
 
   if (memexport_used && shared_memory_) {
+    static uint32_t memexport_draws = 0;
+    if (++memexport_draws == 1 || memexport_draws % 500 == 0) {
+      for (const draw_util::MemExportRange& range : memexport_ranges) {
+        XELOGI("Memexport draw #{}: {:08X} +{}", memexport_draws,
+               range.base_address_dwords << 2, range.size_bytes);
+      }
+    }
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges) {
       shared_memory_->RangeWrittenByGpu(
           memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
@@ -5617,9 +5648,214 @@ bool MetalCommandProcessor::IssueCopy() {
     XELOGW("MetalCommandProcessor::IssueCopy - No render target cache");
     return true;
   }
+  resolve_readback_begin_ = UINT32_MAX;
+  resolve_readback_end_ = 0;
+  bool result = draw_util::IsResolveUsingVertexShader(*register_file_)
+                    ? IssueCopyVertexShaderPath()
+                    : IssueCopyRectangle(nullptr);
+  if (result) {
+    ReadbackResolvedRange();
+  }
+  return result;
+}
 
+void MetalCommandProcessor::ReadbackResolvedRange() {
+  if (GetReadbackResolveMode() != ReadbackResolveMode::kFull ||
+      resolve_readback_begin_ >= resolve_readback_end_ || !shared_memory_) {
+    return;
+  }
+  EndRenderEncoder(RenderEncoderEndReason::kResolveNeedsBoundary);
+  FlushCommandBufferAndWait(/*timeout_ns=*/5000000000ULL, "ResolveReadback");
+  MTL::Buffer* buffer = shared_memory_->GetBuffer();
+  if (!buffer || !buffer->contents()) {
+    return;
+  }
+  std::memcpy(memory_->TranslatePhysical(resolve_readback_begin_),
+              static_cast<const uint8_t*>(buffer->contents()) +
+                  resolve_readback_begin_,
+              resolve_readback_end_ - resolve_readback_begin_);
+  // Debug aid: XENIA_CHECK_RANGES=hexaddr,hexaddr,... (physical, 614400-byte
+  // regions) logs how much of the GPU's shared memory copy matches guest memory.
+  static const char* check_ranges = std::getenv("XENIA_CHECK_RANGES");
+  static uint32_t check_counter = 0;
+  if (check_ranges && ++check_counter % 300 == 0) {
+    // Entries are hexaddr:decimal_length, comma separated.
+    std::string list = check_ranges;
+    size_t pos = 0;
+    while (pos < list.size()) {
+      size_t comma = list.find(',', pos);
+      if (comma == std::string::npos) comma = list.size();
+      std::string entry = list.substr(pos, comma - pos);
+      pos = comma + 1;
+      size_t colon = entry.find(':');
+      uint32_t address = uint32_t(std::stoul(entry.substr(0, colon), nullptr, 16));
+      uint32_t length = colon == std::string::npos
+                            ? 614400
+                            : uint32_t(std::stoul(entry.substr(colon + 1)));
+      const uint8_t* guest = memory_->TranslatePhysical(address);
+      const uint8_t* gpu =
+          static_cast<const uint8_t*>(buffer->contents()) + address;
+      uint32_t same = 0, guest_nonzero = 0;
+      uint64_t hash = 1469598103934665603ull;
+      for (uint32_t i = 0; i < length; ++i) {
+        same += guest[i] == gpu[i];
+        guest_nonzero += guest[i] != 0;
+        hash = (hash ^ guest[i]) * 1099511628211ull;
+      }
+      XELOGI(
+          "Range check {:08X}+{}: guest nonzero {} hash {:016X}, GPU copy equal "
+          "{}, shared memory valid {}",
+          address, length, guest_nonzero, hash, same,
+          shared_memory_->IsRangeValid(address, length));
+    }
+  }
+  if (uint32_t(register_file_->Get<reg::RB_COPY_CONTROL>().copy_command) ==
+      2) {
+    static uint32_t mask_resolves = 0;
+    const uint8_t* bytes = static_cast<const uint8_t*>(
+        memory_->TranslatePhysical(resolve_readback_begin_));
+    if (++mask_resolves % 100 == 0) {
+      uint64_t hash = 1469598103934665603ull, bits = 0;
+      for (uint32_t i = 0; i < resolve_readback_end_ - resolve_readback_begin_;
+           ++i) {
+        hash = (hash ^ bytes[i]) * 1099511628211ull;
+        bits += __builtin_popcount(bytes[i]);
+      }
+      XELOGI("Mask resolve #{}: {} bytes, {} bits set, hash {:016X}",
+             mask_resolves, resolve_readback_end_ - resolve_readback_begin_,
+             bits, hash);
+    }
+  }
+  {
+    // Debug aid: per resolve type, how many distinct outputs and how many
+    // non-zero ones, to see which classifier stage stays constant.
+    struct StageStats {
+      std::set<uint64_t> hashes;
+      uint64_t count = 0, nonzero = 0;
+    };
+    static std::map<std::string, StageStats> stages;
+    static uint64_t stage_resolves = 0;
+    const uint32_t stage_length = resolve_readback_end_ - resolve_readback_begin_;
+    if (stage_length <= (1u << 20)) {
+      auto control = register_file_->Get<reg::RB_COPY_CONTROL>();
+      auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+      auto pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
+      const uint8_t* bytes = static_cast<const uint8_t*>(
+          memory_->TranslatePhysical(resolve_readback_begin_));
+      uint64_t hash = 1469598103934665603ull;
+      bool any = false;
+      for (uint32_t i = 0; i < stage_length; ++i) {
+        hash = (hash ^ bytes[i]) * 1099511628211ull;
+        any |= bytes[i] != 0;
+      }
+      std::string key = fmt::format(
+          "cmd{} fmt{} {}x{}", uint32_t(control.copy_command),
+          uint32_t(dest_info.copy_dest_format), uint32_t(pitch.copy_dest_pitch),
+          uint32_t(pitch.copy_dest_height));
+      StageStats& stats = stages[key];
+      if (key == "cmd1 fmt6 640x240" &&
+          (stats.count == 0 || stats.count == 100 || stats.count == 600)) {
+        XELOGI("Draws before {} resolve #{} (nonzero {}):", key, stats.count,
+               any);
+        for (const std::string& line : g_recent_draws) {
+          XELOGI("  {}", line);
+        }
+      }
+      g_recent_draws.clear();
+      ++stats.count;
+      stats.nonzero += any;
+      if (stats.hashes.size() < 100000) stats.hashes.insert(hash);
+      if (++stage_resolves % 3000 == 0) {
+        for (auto& [name, s] : stages) {
+          XELOGI("Stage {}: {} resolves, {} distinct, {} non-zero", name,
+                 s.count, s.hashes.size(), s.nonzero);
+        }
+      }
+    }
+  }
+  // Debug aid: XENIA_RESOLVE_DUMP=dir saves a few resolve outputs per
+  // (command, format) so the classifier masks can be inspected offline.
+  const uint32_t dump_length = resolve_readback_end_ - resolve_readback_begin_;
+  static const char* dump_dir = std::getenv("XENIA_RESOLVE_DUMP");
+  if (dump_dir) {
+    static std::map<uint32_t, uint32_t> seen;
+    auto control = register_file_->Get<reg::RB_COPY_CONTROL>();
+    auto dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
+    uint32_t key = uint32_t(control.copy_command) << 8 |
+                   uint32_t(dest_info.copy_dest_format);
+    uint32_t n = seen[key]++;
+    if (n == 0 || (n % 400 == 0 && n < 4000)) {
+      auto pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
+      std::string path = fmt::format(
+          "{}/res_cmd{}_fmt{}_n{}_addr{:08X}_len{}_pitch{}_h{}.bin", dump_dir,
+          uint32_t(control.copy_command), uint32_t(dest_info.copy_dest_format),
+          n, resolve_readback_begin_, dump_length,
+          uint32_t(pitch.copy_dest_pitch), uint32_t(pitch.copy_dest_height));
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(memory_->TranslatePhysical(resolve_readback_begin_), 1,
+                    dump_length, f);
+        std::fclose(f);
+      }
+    }
+  }
+
+}
+
+bool MetalCommandProcessor::IssueCopyVertexShaderPath() {
+  Shader* vertex_shader = active_vertex_shader();
+  if (!vertex_shader) {
+    XELOGE("Resolve draw has no vertex shader");
+    return false;
+  }
+  if (!vertex_shader->is_ucode_analyzed()) {
+    vertex_shader->AnalyzeUcode(pipeline_cache_->ucode_disasm_buffer());
+  }
+  ResolveVertexProcessor vertex_processor(*register_file_, *memory_,
+                                          trace_writer_);
+  if (!vertex_processor.Process(*vertex_shader)) {
+    return false;
+  }
+  {
+    static uint64_t calls = 0, rectangles = 0, empty_calls = 0;
+    ++calls;
+    rectangles += vertex_processor.rectangles().size();
+    empty_calls += vertex_processor.rectangles().empty();
+    static int layout_dumps = 0;
+    if (vertex_processor.rectangles().size() > 100 && layout_dumps < 2) {
+      ++layout_dumps;
+      const auto& rects = vertex_processor.rectangles();
+      for (size_t r = 0; r < std::min<size_t>(rects.size(), 24); ++r) {
+        XELOGI("Resolve rect layout[{}]: l={} t={} r={} b={}", r, rects[r].left,
+               rects[r].top, rects[r].right, rects[r].bottom);
+      }
+    }
+    if (calls == 1 || calls % 500 == 0) {
+      auto control = register_file_->Get<reg::RB_COPY_CONTROL>();
+      XELOGI(
+          "Resolve vertex shader path: {} draws, {} rectangles, {} empty "
+          "(last: {} indices, {} rectangles, copy_command {}, dest format {})",
+          calls, rectangles, empty_calls,
+          register_file_->Get<reg::VGT_DRAW_INITIATOR>().num_indices,
+          vertex_processor.rectangles().size(),
+          uint32_t(control.copy_command),
+          uint32_t(register_file_->Get<reg::RB_COPY_DEST_INFO>()
+                       .copy_dest_format));
+    }
+  }
+  for (const draw_util::ResolveRectangle& rectangle :
+       vertex_processor.rectangles()) {
+    if (!IssueCopyRectangle(&rectangle)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool MetalCommandProcessor::IssueCopyRectangle(
+    const draw_util::ResolveRectangle* rectangle) {
   MetalRenderTargetCache::ResolvePlan resolve_plan;
-  if (!render_target_cache_->PrepareResolvePlan(*memory_, resolve_plan)) {
+  if (!render_target_cache_->PrepareResolvePlan(*memory_, resolve_plan,
+                                                rectangle)) {
     XELOGE("MetalCommandProcessor::IssueCopy - Resolve planning failed");
     return false;
   }
@@ -5643,6 +5879,12 @@ bool MetalCommandProcessor::IssueCopy() {
                                      copy_command_buffer, &resolve_plan)) {
     XELOGE("MetalCommandProcessor::IssueCopy - Resolve failed");
     return false;
+  }
+
+  if (written_length) {
+    resolve_readback_begin_ = std::min(resolve_readback_begin_, written_address);
+    resolve_readback_end_ =
+        std::max(resolve_readback_end_, written_address + written_length);
   }
 
   return true;
