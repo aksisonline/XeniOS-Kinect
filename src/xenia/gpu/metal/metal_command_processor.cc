@@ -11,6 +11,7 @@
 
 #include <dispatch/dispatch.h>
 #include <algorithm>
+#include <unistd.h>
 #include <set>
 #include <map>
 #include <cstdio>
@@ -2702,6 +2703,51 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         uint32_t(edram_mode)));
     if (g_recent_draws.size() > 64) {
       g_recent_draws.erase(g_recent_draws.begin());
+    }
+  }
+  {
+    // Debug aid: `touch /tmp/xenia_trace_draws` while a screen is up to log the
+    // next 700 draws: shaders and the formats/signs/swizzles of bound textures.
+    static uint32_t trace_remaining = 0, trace_poll = 0, trace_index = 0;
+    if (!trace_remaining && ++trace_poll % 60 == 0 &&
+        access("/tmp/xenia_trace_draws", F_OK) == 0) {
+      unlink("/tmp/xenia_trace_draws");
+      trace_remaining = 700;
+      trace_index = 0;
+      XELOGI("Draw trace armed");
+    }
+    if (trace_remaining) {
+      --trace_remaining;
+      auto color_info = regs.Get<reg::RB_COLOR_INFO>();
+      std::string line = fmt::format(
+          "Draw trace #{}: prim {} idx {} rt0fmt {} vs {:016X} ps {}",
+          trace_index++, uint32_t(primitive_type), index_count,
+          uint32_t(color_info.color_format), vertex_shader->ucode_data_hash(),
+          pixel_shader ? fmt::format("{:016X}", pixel_shader->ucode_data_hash())
+                       : std::string("none"));
+      auto add_bindings = [&](const char* stage, Shader* shader) {
+        if (!shader) return;
+        for (const auto& binding : shader->texture_bindings()) {
+          auto f = regs.GetTextureFetch(binding.fetch_constant);
+          uint32_t width = f.size_2d.width + 1, height = f.size_2d.height + 1;
+          if (uint32_t(binding.fetch_instr.dimension) == 0) {  // 1D
+            width = f.size_1d.width + 1;
+            height = 1;
+          }
+          line += fmt::format(
+              " | {} fc{} dim{} fmt{} {}x{} base{:08X} end{} sign{}{}{}{} "
+              "numfmt{} sw{:03X} exp{} tiled{}",
+              stage, binding.fetch_constant,
+              uint32_t(binding.fetch_instr.dimension), uint32_t(f.format),
+              width, height, uint32_t(f.base_address) << 12,
+              uint32_t(f.endianness), uint32_t(f.sign_x), uint32_t(f.sign_y),
+              uint32_t(f.sign_z), uint32_t(f.sign_w), uint32_t(f.num_format),
+              uint32_t(f.swizzle), int32_t(f.exp_adjust), uint32_t(f.tiled));
+        }
+      };
+      add_bindings("VS", vertex_shader);
+      add_bindings("PS", pixel_shader);
+      XELOGI("{}", line);
     }
   }
   bool memexport_used_pixel =

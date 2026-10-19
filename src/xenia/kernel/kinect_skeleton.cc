@@ -53,6 +53,17 @@ DEFINE_bool(kinect_live_skeleton, false,
 DEFINE_int32(kinect_skeleton_port, 5760,
              "UDP port the pose tracker sends skeleton packets to.", "Kinect");
 
+DEFINE_double(kinect_cursor_gain_x, 1.5,
+              "Hand cursor sensitivity, horizontal (pointer units per metre).",
+              "Kinect");
+DEFINE_double(kinect_cursor_gain_y, 2.6,
+              "Hand cursor sensitivity, vertical (pointer units per metre).",
+              "Kinect");
+DEFINE_double(kinect_cursor_center_y, -0.10,
+              "Hand height relative to the shoulders (m) that puts the cursor "
+              "at mid-screen.",
+              "Kinect");
+
 DEFINE_bool(kinect_fake_skeleton, false,
             "Feed the title a synthetic standing player instead of its own "
             "(unreliable) skeleton tracker. Kinect Sports only.",
@@ -359,7 +370,7 @@ void GetFrameHeaderHook(cpu::ppc::PPCContext* ppc_context,
 // asks the SDK's interaction library for a hand pointer; no SDK skeleton exists
 // here, so compute it from the injected player: the hand's offset from the
 // shoulder centre in metres, in the SDK's pointer space where +-0.75 spans the
-// screen (x right, y up). Only valid while the hand is raised above the spine.
+// screen (x right, y up). Only valid while the hand is above the hips.
 void GetHandPositionHook(cpu::ppc::PPCContext* ppc_context,
                          KernelState* kernel_state) {
   Memory* memory = kernel_state->memory();
@@ -378,11 +389,14 @@ void GetHandPositionHook(cpu::ppc::PPCContext* ppc_context,
   // ponytail: hand index 1 = right hand, 0 = left; swap here if reversed.
   const Vec4& h = skeleton.joints[hand ? 11 : 7];
   const Vec4& shoulders = skeleton.joints[2];
-  const Vec4& spine = skeleton.joints[1];
-  if (h.y < spine.y) return;  // hand down: no cursor
-  constexpr float kGain = 1.5f;
-  float x = std::clamp((h.x - shoulders.x) * kGain, -0.75f, 0.75f);
-  float y = std::clamp((h.y - shoulders.y) * kGain, -0.75f, 0.75f);
+  const Vec4& hips = skeleton.joints[0];
+  if (h.y < hips.y) return;  // hand below the hips: no cursor
+  float x = std::clamp(float((h.x - shoulders.x) * cvars::kinect_cursor_gain_x),
+                       -0.75f, 0.75f);
+  float y = std::clamp(
+      float((h.y - (shoulders.y + cvars::kinect_cursor_center_y)) *
+            cvars::kinect_cursor_gain_y),
+      -0.75f, 0.75f);
 
   // The title's own mapping from pointer space to screen pixels.
   const float width = float(int32_t(
